@@ -1,9 +1,31 @@
-# OpenDAL Java Bindings
+# Apache OpenDAL™ Java Bindings
 
-[![Maven Central](https://img.shields.io/maven-central/v/org.apache.opendal/opendal-java.svg?logo=Apache+Maven&logoColor=blue)](https://central.sonatype.com/search?q=opendal-java&smo=true)
+![](https://img.shields.io/badge/status-released-blue)
+[![Maven Central](https://img.shields.io/maven-central/v/org.apache.opendal/opendal.svg?logo=Apache+Maven&logoColor=blue)](https://central.sonatype.com/search?q=opendal&smo=true)
 [![Website](https://img.shields.io/badge/opendal-OpenDAL_Website-red?logo=Apache&logoColor=red)](https://opendal.apache.org/docs/java/)
 
-![](https://github.com/apache/incubator-opendal/assets/5351546/87bbf6e5-f19e-449a-b368-3e283016c887)
+![](https://github.com/apache/opendal/assets/5351546/87bbf6e5-f19e-449a-b368-3e283016c887)
+
+## Example
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+import org.apache.opendal.AsyncOperator;
+import org.apache.opendal.Operator;
+
+public class Main {
+  public static void main(String[] args) {
+    final Map<String, String> conf = new HashMap<>();
+    conf.put("root", "/tmp");
+
+    try (AsyncOperator op = AsyncOperator.of("fs", conf)) {
+      op.write("/path/to/data", "Hello world").join();
+      System.out.println(new String(op.read("/path/to/data").join()));
+    }
+  }
+}
+```
 
 ## Getting Started
 
@@ -25,18 +47,18 @@ Generally, you can first add the `os-maven-plugin` for automatically detect the 
 </build>
 ```
 
-Then add the dependency to `opendal-java` as following:
+Then add the dependency to `opendal` as following:
 
 ```xml
 <dependencies>
 <dependency>
   <groupId>org.apache.opendal</groupId>
-  <artifactId>opendal-java</artifactId>
+  <artifactId>opendal</artifactId>
   <version>${opendal.version}</version>
 </dependency>
 <dependency>
   <groupId>org.apache.opendal</groupId>
-  <artifactId>opendal-java</artifactId>
+  <artifactId>opendal</artifactId>
   <version>${opendal.version}</version>
   <classifier>${os.detected.classifier}</classifier>
 </dependency>
@@ -53,12 +75,12 @@ plugins {
 }
 ```
 
-Then add the dependency to `opendal-java` as following:
+Then add the dependency to `opendal as following:
 
 ```groovy
 dependencies {
-    implementation "org.apache.opendal:opendal-java:0.40.0"
-    implementation "org.apache.opendal:opendal-java:0.40.0:$osdetector.classifier"
+    implementation "org.apache.opendal:opendal:$opendalVersion"
+    implementation "org.apache.opendal:opendal:$opendalVersion:$osdetector.classifier"
 }
 ```
 
@@ -79,7 +101,7 @@ To load the shared library correctly, you can choose one of the following approa
 
 ## Build
 
-This project provides OpenDAL Java bindings with artifact name `opendal-java`. It depends on JDK 8 or later.
+This project provides OpenDAL Java bindings with artifact name `opendal`. It depends on JDK 8 or later.
 
 You can use Maven to build both Rust dynamic lib and JAR files with one command now:
 
@@ -107,27 +129,37 @@ You can apply the code style with the following command::
 ./mvnw spotless:apply
 ```
 
-## Run Service Tests
+## Run behavior tests
 
-Services tests read necessary configs from env vars or the `.env` file.
+Services behavior tests read necessary configs from env vars or the `.env` file.
 
 You can copy [.env.example](/.env.example) to `${project.rootdir}/.env` and change the values on need, or directly set env vars with `export KEY=VALUE`.
 
 Take `fs` for example, we need to enable bench on `fs` on `/tmp`:
 
 ```properties
-OPENDAL_FS_TEST=on
-OPENDAL_FS_ROOT=/opendal
+OPENDAL_TEST=fs
+OPENDAL_FS_ROOT=/tmp
 ```
 
-You can run service tests of enabled with the following command:
+You can run service behavior tests of enabled with the following command:
 
 ```shell
-./mvnw test -Dtest=org.apache.opendal.behavior.FsTest # replace with the certain service tests
+./mvnw test -Dtest="behavior.*Test"
 ```
 
 Remember to enable the necessary features via `-Dcargo-build.features=services-xxx` when running specific service test:
 
 ```shell
-./mvnw test -Dtest=org.apache.opendal.behavior.RedisTest -Dcargo-build.features=services-redis
+export OPENDAL_TEST=redis
+export OPENDAL_REDIS_ENDPOINT=tcp://127.0.0.1:6379
+export OPENDAL_REDIS_ROOT=/
+export OPENDAL_REDIS_DB=0
+./mvnw test -Dtest="behavior.*Test" -Dcargo-build.features=services-redis
 ```
+
+## License and Trademarks
+
+Licensed under the Apache License, Version 2.0: http://www.apache.org/licenses/LICENSE-2.0
+
+Apache OpenDAL, OpenDAL, and Apache are either registered trademarks or trademarks of the Apache Software Foundation.

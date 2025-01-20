@@ -18,6 +18,7 @@
 *)
 
 let new_operator = Opendal_core.Operator.operator
+let list = Opendal_core.Operator.blocking_list
 let stat = Opendal_core.Operator.blocking_stat
 let is_exist = Opendal_core.Operator.blocking_is_exist
 let create_dir = Opendal_core.Operator.blocking_create_dir
@@ -31,16 +32,7 @@ let remove = Opendal_core.Operator.blocking_remove
 let remove_all = Opendal_core.Operator.blocking_remove_all
 
 module Reader = struct
-  let read = Opendal_core.Operator.reader_read
-
-  let seek reader pos mode =
-    let inner_pos =
-      match mode with
-      | Unix.SEEK_CUR -> Opendal_core.Seek_from.Current pos
-      | Unix.SEEK_END -> Opendal_core.Seek_from.End pos
-      | Unix.SEEK_SET -> Opendal_core.Seek_from.Start pos
-    in
-    Opendal_core.Operator.reader_seek reader inner_pos
+  let pread = Opendal_core.Operator.reader_pread
 end
 
 module Metadata = struct
@@ -52,4 +44,10 @@ module Metadata = struct
   let content_disposition = Opendal_core.Operator.metadata_content_disposition
   let etag = Opendal_core.Operator.metadata_etag
   let last_modified = Opendal_core.Operator.metadata_last_modified
+end
+
+module Entry = struct
+  let path = Opendal_core.Operator.entry_path
+  let name = Opendal_core.Operator.entry_name
+  let metadata = Opendal_core.Operator.entry_metadata
 end

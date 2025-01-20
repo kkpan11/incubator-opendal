@@ -15,51 +15,52 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::str;
 
-use async_trait::async_trait;
+use bytes::Buf;
 use bytes::Bytes;
-use hrana_client_proto::pipeline::{
-    ClientMsg, Response, ServerMsg, StreamExecuteReq, StreamExecuteResult, StreamRequest,
-    StreamResponse, StreamResponseError, StreamResponseOk,
-};
+use hrana_client_proto::pipeline::ClientMsg;
+use hrana_client_proto::pipeline::Response;
+use hrana_client_proto::pipeline::ServerMsg;
+use hrana_client_proto::pipeline::StreamExecuteReq;
+use hrana_client_proto::pipeline::StreamExecuteResult;
+use hrana_client_proto::pipeline::StreamRequest;
+use hrana_client_proto::pipeline::StreamResponse;
+use hrana_client_proto::pipeline::StreamResponseError;
+use hrana_client_proto::pipeline::StreamResponseOk;
 use hrana_client_proto::Error as PipelineError;
-use hrana_client_proto::{Stmt, StmtResult, Value};
-use http::{Request, Uri};
-
-use crate::raw::adapters::kv;
-use crate::raw::*;
-use crate::*;
+use hrana_client_proto::Stmt;
+use hrana_client_proto::StmtResult;
+use hrana_client_proto::Value;
+use http::Request;
+use http::Uri;
 
 use super::error::parse_error;
+use crate::raw::adapters::kv;
+use crate::raw::*;
+use crate::services::LibsqlConfig;
+use crate::*;
+
+impl Configurator for LibsqlConfig {
+    type Builder = LibsqlBuilder;
+    fn into_builder(self) -> Self::Builder {
+        LibsqlBuilder { config: self }
+    }
+}
 
 #[doc = include_str!("docs.md")]
 #[derive(Default)]
 pub struct LibsqlBuilder {
-    connection_string: Option<String>,
-    auth_token: Option<String>,
-
-    table: Option<String>,
-    key_field: Option<String>,
-    value_field: Option<String>,
-    root: Option<String>,
+    config: LibsqlConfig,
 }
 
 impl Debug for LibsqlBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut ds = f.debug_struct("LibsqlBuilder");
-        ds.field("connection_string", &self.connection_string)
-            .field("table", &self.table)
-            .field("key_field", &self.key_field)
-            .field("value_field", &self.value_field)
-            .field("root", &self.root);
+        let mut d = f.debug_struct("LibsqlBuilder");
 
-        if self.auth_token.is_some() {
-            ds.field("auth_token", &"<redacted>");
-        }
-        ds.finish()
+        d.field("config", &self.config);
+        d.finish()
     }
 }
 
@@ -77,9 +78,9 @@ impl LibsqlBuilder {
     /// - `http://example.com/db`
     /// - `https://example.com/db`
     /// - `libsql://example.com/db`
-    pub fn connection_string(&mut self, v: &str) -> &mut Self {
+    pub fn connection_string(mut self, v: &str) -> Self {
         if !v.is_empty() {
-            self.connection_string = Some(v.to_string());
+            self.config.connection_string = Some(v.to_string());
         }
         self
     }
@@ -87,9 +88,9 @@ impl LibsqlBuilder {
     /// set the authentication token for libsql service.
     ///
     /// default: no authentication token
-    pub fn auth_token(&mut self, auth_token: &str) -> &mut Self {
+    pub fn auth_token(mut self, auth_token: &str) -> Self {
         if !auth_token.is_empty() {
-            self.auth_token = Some(auth_token.to_owned());
+            self.config.auth_token = Some(auth_token.to_owned());
         }
         self
     }
@@ -97,17 +98,20 @@ impl LibsqlBuilder {
     /// set the working directory, all operations will be performed under it.
     ///
     /// default: "/"
-    pub fn root(&mut self, root: &str) -> &mut Self {
-        if !root.is_empty() {
-            self.root = Some(root.to_string());
-        }
+    pub fn root(mut self, root: &str) -> Self {
+        self.config.root = if root.is_empty() {
+            None
+        } else {
+            Some(root.to_string())
+        };
+
         self
     }
 
     /// Set the table name of the libsql service to read/write.
-    pub fn table(&mut self, table: &str) -> &mut Self {
+    pub fn table(mut self, table: &str) -> Self {
         if !table.is_empty() {
-            self.table = Some(table.to_string());
+            self.config.table = Some(table.to_string());
         }
         self
     }
@@ -115,9 +119,9 @@ impl LibsqlBuilder {
     /// Set the key field name of the libsql service to read/write.
     ///
     /// Default to `key` if not specified.
-    pub fn key_field(&mut self, key_field: &str) -> &mut Self {
+    pub fn key_field(mut self, key_field: &str) -> Self {
         if !key_field.is_empty() {
-            self.key_field = Some(key_field.to_string());
+            self.config.key_field = Some(key_field.to_string());
         }
         self
     }
@@ -125,9 +129,9 @@ impl LibsqlBuilder {
     /// Set the value field name of the libsql service to read/write.
     ///
     /// Default to `value` if not specified.
-    pub fn value_field(&mut self, value_field: &str) -> &mut Self {
+    pub fn value_field(mut self, value_field: &str) -> Self {
         if !value_field.is_empty() {
-            self.value_field = Some(value_field.to_string());
+            self.config.value_field = Some(value_field.to_string());
         }
         self
     }
@@ -135,40 +139,29 @@ impl LibsqlBuilder {
 
 impl Builder for LibsqlBuilder {
     const SCHEME: Scheme = Scheme::Libsql;
-    type Accessor = LibsqlBackend;
+    type Config = LibsqlConfig;
 
-    fn from_map(map: HashMap<String, String>) -> Self {
-        let mut builder = LibsqlBuilder::default();
-        map.get("connection_string")
-            .map(|v| builder.connection_string(v));
-        map.get("auth_token").map(|v| builder.auth_token(v));
-        map.get("table").map(|v| builder.table(v));
-        map.get("key_field").map(|v| builder.key_field(v));
-        map.get("value_field").map(|v| builder.value_field(v));
-        map.get("root").map(|v| builder.root(v));
-        builder
-    }
-
-    fn build(&mut self) -> Result<Self::Accessor> {
+    fn build(self) -> Result<impl Access> {
         let conn = self.get_connection_string()?;
 
-        let table = match self.table.clone() {
+        let table = match self.config.table.clone() {
             Some(v) => v,
             None => {
                 return Err(Error::new(ErrorKind::ConfigInvalid, "table is empty")
                     .with_context("service", Scheme::Libsql))
             }
         };
-        let key_field = match self.key_field.clone() {
+        let key_field = match self.config.key_field.clone() {
             Some(v) => v,
             None => "key".to_string(),
         };
-        let value_field = match self.value_field.clone() {
+        let value_field = match self.config.value_field.clone() {
             Some(v) => v,
             None => "value".to_string(),
         };
         let root = normalize_root(
-            self.root
+            self.config
+                .root
                 .clone()
                 .unwrap_or_else(|| "/".to_string())
                 .as_str(),
@@ -182,21 +175,21 @@ impl Builder for LibsqlBuilder {
         Ok(LibsqlBackend::new(Adapter {
             client,
             connection_string: conn,
-            auth_token: self.auth_token.clone(),
+            auth_token: self.config.auth_token.clone(),
             table,
             key_field,
             value_field,
         })
-        .with_root(&root))
+        .with_normalized_root(root))
     }
 }
 
 impl LibsqlBuilder {
     fn get_connection_string(&self) -> Result<String> {
-        let connection_string = self
-            .connection_string
-            .clone()
-            .ok_or_else(|| Error::new(ErrorKind::ConfigInvalid, "connection_string is empty"))?;
+        let connection_string =
+            self.config.connection_string.clone().ok_or_else(|| {
+                Error::new(ErrorKind::ConfigInvalid, "connection_string is empty")
+            })?;
 
         let ep_url = connection_string
             .replace("libsql://", "https://")
@@ -278,18 +271,18 @@ impl Adapter {
         })?;
 
         let req = req
-            .body(AsyncBody::Bytes(Bytes::from(body)))
+            .body(Buffer::from(Bytes::from(body)))
             .map_err(new_request_build_error)?;
 
         let resp = self.client.send(req).await?;
 
         if resp.status() != http::StatusCode::OK {
-            return Err(parse_error(resp).await?);
+            return Err(parse_error(resp));
         }
 
-        let bs = resp.into_body().bytes().await?;
+        let bs = resp.into_body();
 
-        let resp: ServerMsg = serde_json::from_slice(&bs).map_err(|e| {
+        let resp: ServerMsg = serde_json::from_reader(bs.reader()).map_err(|e| {
             Error::new(ErrorKind::Unexpected, "deserialize json from response").set_source(e)
         })?;
 
@@ -311,23 +304,24 @@ impl Adapter {
     }
 }
 
-#[async_trait]
 impl kv::Adapter for Adapter {
-    fn metadata(&self) -> kv::Metadata {
-        kv::Metadata::new(
+    type Scanner = ();
+
+    fn info(&self) -> kv::Info {
+        kv::Info::new(
             Scheme::Libsql,
             &self.table,
             Capability {
                 read: true,
                 write: true,
-                create_dir: true,
                 delete: true,
+                shared: true,
                 ..Default::default()
             },
         )
     }
 
-    async fn get(&self, path: &str) -> Result<Option<Vec<u8>>> {
+    async fn get(&self, path: &str) -> Result<Option<Buffer>> {
         let query = format!(
             "SELECT {} FROM {} WHERE `{}` = ? LIMIT 1",
             self.value_field, self.table, self.key_field
@@ -342,12 +336,12 @@ impl kv::Adapter for Adapter {
                     }),
             }) => {
                 if rows.is_empty() || rows[0].is_empty() {
-                    return Ok(None);
+                    Ok(None)
                 } else {
                     let val = &rows[0][0];
                     match val {
                         Value::Null => Ok(None),
-                        Value::Blob { value } => Ok(Some(value.to_owned())),
+                        Value::Blob { value } => Ok(Some(Buffer::from(value.to_vec()))),
                         _ => Err(Error::new(ErrorKind::Unexpected, "invalid value type")),
                     }
                 }
@@ -365,7 +359,7 @@ impl kv::Adapter for Adapter {
         }
     }
 
-    async fn set(&self, path: &str, value: &[u8]) -> Result<()> {
+    async fn set(&self, path: &str, value: Buffer) -> Result<()> {
         let query = format!(
             "INSERT OR REPLACE INTO `{}` (`{}`, `{}`) VALUES (?, ?)",
             self.table, self.key_field, self.value_field

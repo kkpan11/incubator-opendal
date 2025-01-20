@@ -21,9 +21,6 @@
 
 use std::ops::RangeBounds;
 
-use bytes::Bytes;
-use flagset::FlagSet;
-
 use crate::raw::*;
 use crate::*;
 
@@ -31,18 +28,18 @@ use crate::*;
 ///
 /// The function will consume all the input to generate a result.
 pub(crate) struct OperatorFunction<T, R> {
-    inner: FusedAccessor,
+    inner: Accessor,
     path: String,
     args: T,
-    f: fn(FusedAccessor, String, T) -> Result<R>,
+    f: fn(Accessor, String, T) -> Result<R>,
 }
 
 impl<T, R> OperatorFunction<T, R> {
     pub fn new(
-        inner: FusedAccessor,
+        inner: Accessor,
         path: String,
         args: T,
-        f: fn(FusedAccessor, String, T) -> Result<R>,
+        f: fn(Accessor, String, T) -> Result<R>,
     ) -> Self {
         Self {
             inner,
@@ -72,7 +69,7 @@ impl<T, R> OperatorFunction<T, R> {
 pub struct FunctionWrite(
     /// The args for FunctionWrite is a bit special because we also
     /// need to move the bytes input this function.
-    pub(crate) OperatorFunction<(OpWrite, Bytes), ()>,
+    pub(crate) OperatorFunction<(OpWrite, OpWriter, Buffer), ()>,
 );
 
 impl FunctionWrite {
@@ -84,20 +81,31 @@ impl FunctionWrite {
     ///
     /// Service could return `Unsupported` if the underlying storage does not support append.
     pub fn append(mut self, v: bool) -> Self {
-        self.0 = self.0.map_args(|(args, bs)| (args.with_append(v), bs));
+        self.0 = self
+            .0
+            .map_args(|(args, options, bs)| (args.with_append(v), options, bs));
         self
     }
 
-    /// Set the buffer size of op.
+    /// Set the chunk size of op.
     ///
-    /// If buffer size is set, the data will be buffered by the underlying writer.
+    /// If chunk size is set, the data will be chunked by the underlying writer.
     ///
     /// ## NOTE
     ///
-    /// Service could have their own minimum buffer size while perform write operations like
-    /// multipart uploads. So the buffer size may be larger than the given buffer size.
-    pub fn buffer(mut self, v: usize) -> Self {
-        self.0 = self.0.map_args(|(args, bs)| (args.with_buffer(v), bs));
+    /// Service could have their own limitation for chunk size. It's possible that chunk size
+    /// is not equal to the given chunk size.
+    ///
+    /// For example:
+    ///
+    /// - AWS S3 requires the part size to be in [5MiB, 5GiB].
+    /// - GCS requires the part size to be aligned with 256 KiB.
+    ///
+    /// The services will alter the chunk size to meet their requirements.
+    pub fn chunk(mut self, v: usize) -> Self {
+        self.0 = self
+            .0
+            .map_args(|(args, options, bs)| (args, options.with_chunk(v), bs));
         self
     }
 
@@ -105,7 +113,7 @@ impl FunctionWrite {
     pub fn content_type(mut self, v: &str) -> Self {
         self.0 = self
             .0
-            .map_args(|(args, bs)| (args.with_content_type(v), bs));
+            .map_args(|(args, options, bs)| (args.with_content_type(v), options, bs));
         self
     }
 
@@ -113,7 +121,7 @@ impl FunctionWrite {
     pub fn content_disposition(mut self, v: &str) -> Self {
         self.0 = self
             .0
-            .map_args(|(args, bs)| (args.with_content_disposition(v), bs));
+            .map_args(|(args, options, bs)| (args.with_content_disposition(v), options, bs));
         self
     }
 
@@ -121,7 +129,7 @@ impl FunctionWrite {
     pub fn cache_control(mut self, v: &str) -> Self {
         self.0 = self
             .0
-            .map_args(|(args, bs)| (args.with_cache_control(v), bs));
+            .map_args(|(args, options, bs)| (args.with_cache_control(v), options, bs));
         self
     }
 
@@ -138,7 +146,7 @@ impl FunctionWrite {
 pub struct FunctionWriter(
     /// The args for FunctionWriter is a bit special because we also
     /// need to move the bytes input this function.
-    pub(crate) OperatorFunction<OpWrite, BlockingWriter>,
+    pub(crate) OperatorFunction<(OpWrite, OpWriter), BlockingWriter>,
 );
 
 impl FunctionWriter {
@@ -150,38 +158,61 @@ impl FunctionWriter {
     ///
     /// Service could return `Unsupported` if the underlying storage does not support append.
     pub fn append(mut self, v: bool) -> Self {
-        self.0 = self.0.map_args(|args| args.with_append(v));
+        self.0 = self
+            .0
+            .map_args(|(args, options)| (args.with_append(v), options));
         self
     }
 
-    /// Set the buffer size of op.
+    /// Set the chunk size of op.
     ///
-    /// If buffer size is set, the data will be buffered by the underlying writer.
+    /// If chunk size is set, the data will be chunked by the underlying writer.
     ///
     /// ## NOTE
     ///
-    /// Service could have their own minimum buffer size while perform write operations like
-    /// multipart uploads. So the buffer size may be larger than the given buffer size.
-    pub fn buffer(mut self, v: usize) -> Self {
-        self.0 = self.0.map_args(|args| args.with_buffer(v));
+    /// Service could have their own limitation for chunk size. It's possible that chunk size
+    /// is not equal to the given chunk size.
+    ///
+    /// For example:
+    ///
+    /// - AWS S3 requires the part size to be in [5MiB, 5GiB].
+    /// - GCS requires the part size to be aligned with 256 KiB.
+    ///
+    /// The services will alter the chunk size to meet their requirements.
+    pub fn chunk(mut self, v: usize) -> Self {
+        self.0 = self
+            .0
+            .map_args(|(args, options)| (args, options.with_chunk(v)));
         self
+    }
+
+    /// Set the chunk size of op.
+    #[deprecated(note = "Please use `chunk` instead")]
+    pub fn buffer(self, v: usize) -> Self {
+        self.chunk(v)
     }
 
     /// Set the content type of option
     pub fn content_type(mut self, v: &str) -> Self {
-        self.0 = self.0.map_args(|args| args.with_content_type(v));
+        self.0 = self
+            .0
+            .map_args(|(args, options)| (args.with_content_type(v), options));
         self
     }
 
     /// Set the content disposition of option
     pub fn content_disposition(mut self, v: &str) -> Self {
-        self.0 = self.0.map_args(|args| args.with_content_disposition(v));
+        self.0 = self
+            .0
+            .map_args(|(args, options)| (args.with_content_disposition(v), options));
         self
     }
 
     /// Set the content type of option
     pub fn cache_control(mut self, v: &str) -> Self {
-        self.0 = self.0.map_args(|args| args.with_cache_control(v));
+        self.0 = self
+            .0
+            .map_args(|(args, options)| (args.with_cache_control(v), options));
         self
     }
 
@@ -217,27 +248,30 @@ impl FunctionDelete {
 pub struct FunctionList(pub(crate) OperatorFunction<OpList, Vec<Entry>>);
 
 impl FunctionList {
-    /// Change the limit of this list operation.
+    /// The limit passed to underlying service to specify the max results
+    /// that could return per-request.
+    ///
+    /// Users could use this to control the memory usage of list operation.
     pub fn limit(mut self, v: usize) -> Self {
         self.0 = self.0.map_args(|args| args.with_limit(v));
         self
     }
 
-    /// Change the start_after of this list operation.
+    /// The start_after passes to underlying service to specify the specified key
+    /// to start listing from.
     pub fn start_after(mut self, v: &str) -> Self {
         self.0 = self.0.map_args(|args| args.with_start_after(v));
         self
     }
 
-    /// Change the delimiter. The default delimiter is "/"
-    pub fn delimiter(mut self, v: &str) -> Self {
-        self.0 = self.0.map_args(|args| args.with_delimiter(v));
-        self
-    }
-
-    /// Change the metakey. The default metakey is `Metakey::Mode`.
-    pub fn metakey(mut self, v: impl Into<FlagSet<Metakey>>) -> Self {
-        self.0 = self.0.map_args(|args| args.with_metakey(v));
+    /// The recursive is used to control whether the list operation is recursive.
+    ///
+    /// - If `false`, list operation will only list the entries under the given path.
+    /// - If `true`, list operation will list all entries that starts with given path.
+    ///
+    /// Default to `false`.
+    pub fn recursive(mut self, v: bool) -> Self {
+        self.0 = self.0.map_args(|args| args.with_recursive(v));
         self
     }
 
@@ -254,27 +288,30 @@ impl FunctionList {
 pub struct FunctionLister(pub(crate) OperatorFunction<OpList, BlockingLister>);
 
 impl FunctionLister {
-    /// Change the limit of this list operation.
+    /// The limit passed to underlying service to specify the max results
+    /// that could return per-request.
+    ///
+    /// Users could use this to control the memory usage of list operation.
     pub fn limit(mut self, v: usize) -> Self {
         self.0 = self.0.map_args(|args| args.with_limit(v));
         self
     }
 
-    /// Change the start_after of this list operation.
+    /// The start_after passes to underlying service to specify the specified key
+    /// to start listing from.
     pub fn start_after(mut self, v: &str) -> Self {
         self.0 = self.0.map_args(|args| args.with_start_after(v));
         self
     }
 
-    /// Change the delimiter. The default delimiter is "/"
-    pub fn delimiter(mut self, v: &str) -> Self {
-        self.0 = self.0.map_args(|args| args.with_delimiter(v));
-        self
-    }
-
-    /// Change the metakey. The default metakey is `Metakey::Mode`.
-    pub fn metakey(mut self, v: impl Into<FlagSet<Metakey>>) -> Self {
-        self.0 = self.0.map_args(|args| args.with_metakey(v));
+    /// The recursive is used to control whether the list operation is recursive.
+    ///
+    /// - If `false`, list operation will only list the entries under the given path.
+    /// - If `true`, list operation will list all entries that starts with given path.
+    ///
+    /// Default to `false`.
+    pub fn recursive(mut self, v: bool) -> Self {
+        self.0 = self.0.map_args(|args| args.with_recursive(v));
         self
     }
 
@@ -288,18 +325,18 @@ impl FunctionLister {
 /// Function that generated by [`BlockingOperator::read_with`].
 ///
 /// Users can add more options by public functions provided by this struct.
-pub struct FunctionRead(pub(crate) OperatorFunction<OpRead, Vec<u8>>);
+pub struct FunctionRead(pub(crate) OperatorFunction<(OpRead, BytesRange), Buffer>);
 
 impl FunctionRead {
     /// Set the range for this operation.
     pub fn range(mut self, range: impl RangeBounds<u64>) -> Self {
-        self.0 = self.0.map_args(|args| args.with_range(range.into()));
+        self.0 = self.0.map_args(|(args, _)| (args, range.into()));
         self
     }
 
     /// Call the function to consume all the input and generate a
     /// result.
-    pub fn call(self) -> Result<Vec<u8>> {
+    pub fn call(self) -> Result<Buffer> {
         self.0.call()
     }
 }
@@ -310,12 +347,6 @@ impl FunctionRead {
 pub struct FunctionReader(pub(crate) OperatorFunction<OpRead, BlockingReader>);
 
 impl FunctionReader {
-    /// Set the range for this operation.
-    pub fn range(mut self, range: impl RangeBounds<u64>) -> Self {
-        self.0 = self.0.map_args(|args| args.with_range(range.into()));
-        self
-    }
-
     /// Sets the content-disposition header that should be send back by the remote read operation.
     pub fn override_content_disposition(mut self, content_disposition: &str) -> Self {
         self.0 = self

@@ -37,6 +37,10 @@ use serde::Serialize;
 use crate::raw::*;
 use crate::*;
 
+pub mod constants {
+    pub const X_OBS_META_PREFIX: &str = "x-obs-meta-";
+}
+
 pub struct ObsCore {
     pub bucket: String,
     pub root: String,
@@ -95,7 +99,7 @@ impl ObsCore {
     }
 
     #[inline]
-    pub async fn send(&self, req: Request<AsyncBody>) -> Result<Response<IncomingAsyncBody>> {
+    pub async fn send(&self, req: Request<Buffer>) -> Result<Response<Buffer>> {
         self.client.send(req).await
     }
 }
@@ -104,16 +108,22 @@ impl ObsCore {
     pub async fn obs_get_object(
         &self,
         path: &str,
+        range: BytesRange,
         args: &OpRead,
-    ) -> Result<Response<IncomingAsyncBody>> {
-        let mut req = self.obs_get_object_request(path, args)?;
+    ) -> Result<Response<HttpBody>> {
+        let mut req = self.obs_get_object_request(path, range, args)?;
 
         self.sign(&mut req).await?;
 
-        self.send(req).await
+        self.client.fetch(req).await
     }
 
-    pub fn obs_get_object_request(&self, path: &str, args: &OpRead) -> Result<Request<AsyncBody>> {
+    pub fn obs_get_object_request(
+        &self,
+        path: &str,
+        range: BytesRange,
+        args: &OpRead,
+    ) -> Result<Request<Buffer>> {
         let p = build_abs_path(&self.root, path);
 
         let url = format!("{}/{}", self.endpoint, percent_encode_path(&p));
@@ -124,8 +134,7 @@ impl ObsCore {
             req = req.header(IF_MATCH, if_match);
         }
 
-        let range = args.range();
-        if !range.is_full() {
+        if range.is_full() {
             req = req.header(http::header::RANGE, range.to_header())
         }
 
@@ -133,9 +142,7 @@ impl ObsCore {
             req = req.header(IF_NONE_MATCH, if_none_match);
         }
 
-        let req = req
-            .body(AsyncBody::Empty)
-            .map_err(new_request_build_error)?;
+        let req = req.body(Buffer::new()).map_err(new_request_build_error)?;
 
         Ok(req)
     }
@@ -145,8 +152,8 @@ impl ObsCore {
         path: &str,
         size: Option<u64>,
         args: &OpWrite,
-        body: AsyncBody,
-    ) -> Result<Request<AsyncBody>> {
+        body: Buffer,
+    ) -> Result<Request<Buffer>> {
         let p = build_abs_path(&self.root, path);
 
         let url = format!("{}/{}", self.endpoint, percent_encode_path(&p));
@@ -164,16 +171,19 @@ impl ObsCore {
             req = req.header(CONTENT_TYPE, mime)
         }
 
+        // Set user metadata headers.
+        if let Some(user_metadata) = args.user_metadata() {
+            for (key, value) in user_metadata {
+                req = req.header(format!("{}{}", constants::X_OBS_META_PREFIX, key), value)
+            }
+        }
+
         let req = req.body(body).map_err(new_request_build_error)?;
 
         Ok(req)
     }
 
-    pub async fn obs_head_object(
-        &self,
-        path: &str,
-        args: &OpStat,
-    ) -> Result<Response<IncomingAsyncBody>> {
+    pub async fn obs_head_object(&self, path: &str, args: &OpStat) -> Result<Response<Buffer>> {
         let mut req = self.obs_head_object_request(path, args)?;
 
         self.sign(&mut req).await?;
@@ -181,7 +191,7 @@ impl ObsCore {
         self.send(req).await
     }
 
-    pub fn obs_head_object_request(&self, path: &str, args: &OpStat) -> Result<Request<AsyncBody>> {
+    pub fn obs_head_object_request(&self, path: &str, args: &OpStat) -> Result<Request<Buffer>> {
         let p = build_abs_path(&self.root, path);
 
         let url = format!("{}/{}", self.endpoint, percent_encode_path(&p));
@@ -199,23 +209,19 @@ impl ObsCore {
             req = req.header(IF_NONE_MATCH, if_none_match);
         }
 
-        let req = req
-            .body(AsyncBody::Empty)
-            .map_err(new_request_build_error)?;
+        let req = req.body(Buffer::new()).map_err(new_request_build_error)?;
 
         Ok(req)
     }
 
-    pub async fn obs_delete_object(&self, path: &str) -> Result<Response<IncomingAsyncBody>> {
+    pub async fn obs_delete_object(&self, path: &str) -> Result<Response<Buffer>> {
         let p = build_abs_path(&self.root, path);
 
         let url = format!("{}/{}", self.endpoint, percent_encode_path(&p));
 
         let req = Request::delete(&url);
 
-        let mut req = req
-            .body(AsyncBody::Empty)
-            .map_err(new_request_build_error)?;
+        let mut req = req.body(Buffer::new()).map_err(new_request_build_error)?;
 
         self.sign(&mut req).await?;
 
@@ -228,8 +234,8 @@ impl ObsCore {
         position: u64,
         size: u64,
         args: &OpWrite,
-        body: AsyncBody,
-    ) -> Result<Request<AsyncBody>> {
+        body: Buffer,
+    ) -> Result<Request<Buffer>> {
         let p = build_abs_path(&self.root, path);
         let url = format!(
             "{}/{}?append&position={}",
@@ -258,11 +264,7 @@ impl ObsCore {
         Ok(req)
     }
 
-    pub async fn obs_copy_object(
-        &self,
-        from: &str,
-        to: &str,
-    ) -> Result<Response<IncomingAsyncBody>> {
+    pub async fn obs_copy_object(&self, from: &str, to: &str) -> Result<Response<Buffer>> {
         let source = build_abs_path(&self.root, from);
         let target = build_abs_path(&self.root, to);
 
@@ -271,7 +273,7 @@ impl ObsCore {
 
         let mut req = Request::put(&url)
             .header("x-obs-copy-source", &source)
-            .body(AsyncBody::Empty)
+            .body(Buffer::new())
             .map_err(new_request_build_error)?;
 
         self.sign(&mut req).await?;
@@ -285,7 +287,7 @@ impl ObsCore {
         next_marker: &str,
         delimiter: &str,
         limit: Option<usize>,
-    ) -> Result<Response<IncomingAsyncBody>> {
+    ) -> Result<Response<Buffer>> {
         let p = build_abs_path(&self.root, path);
 
         let mut queries = vec![];
@@ -309,7 +311,7 @@ impl ObsCore {
         };
 
         let mut req = Request::get(&url)
-            .body(AsyncBody::Empty)
+            .body(Buffer::new())
             .map_err(new_request_build_error)?;
 
         self.sign(&mut req).await?;
@@ -320,7 +322,7 @@ impl ObsCore {
         &self,
         path: &str,
         content_type: Option<&str>,
-    ) -> Result<Response<IncomingAsyncBody>> {
+    ) -> Result<Response<Buffer>> {
         let p = build_abs_path(&self.root, path);
 
         let url = format!("{}/{}?uploads", self.endpoint, percent_encode_path(&p));
@@ -329,9 +331,7 @@ impl ObsCore {
         if let Some(mime) = content_type {
             req = req.header(CONTENT_TYPE, mime)
         }
-        let mut req = req
-            .body(AsyncBody::Empty)
-            .map_err(new_request_build_error)?;
+        let mut req = req.body(Buffer::new()).map_err(new_request_build_error)?;
 
         self.sign(&mut req).await?;
 
@@ -343,8 +343,8 @@ impl ObsCore {
         upload_id: &str,
         part_number: usize,
         size: Option<u64>,
-        body: AsyncBody,
-    ) -> Result<Response<IncomingAsyncBody>> {
+        body: Buffer,
+    ) -> Result<Response<Buffer>> {
         let p = build_abs_path(&self.root, path);
 
         let url = format!(
@@ -374,7 +374,7 @@ impl ObsCore {
         path: &str,
         upload_id: &str,
         parts: Vec<CompleteMultipartUploadRequestPart>,
-    ) -> Result<Response<IncomingAsyncBody>> {
+    ) -> Result<Response<Buffer>> {
         let p = build_abs_path(&self.root, path);
         let url = format!(
             "{}/{}?uploadId={}",
@@ -395,7 +395,7 @@ impl ObsCore {
         let req = req.header(CONTENT_TYPE, "application/xml");
 
         let mut req = req
-            .body(AsyncBody::Bytes(Bytes::from(content)))
+            .body(Buffer::from(Bytes::from(content)))
             .map_err(new_request_build_error)?;
 
         self.sign(&mut req).await?;
@@ -407,7 +407,7 @@ impl ObsCore {
         &self,
         path: &str,
         upload_id: &str,
-    ) -> Result<Response<IncomingAsyncBody>> {
+    ) -> Result<Response<Buffer>> {
         let p = build_abs_path(&self.root, path);
 
         let url = format!(
@@ -418,7 +418,7 @@ impl ObsCore {
         );
 
         let mut req = Request::delete(&url)
-            .body(AsyncBody::Empty)
+            .body(Buffer::new())
             .map_err(new_request_build_error)?;
 
         self.sign(&mut req).await?;
@@ -462,7 +462,7 @@ pub struct CompleteMultipartUploadRequestPart {
     ///     etag: String,
     /// }
     ///
-    /// fn partial_escape<S>(s: &str, ser: S) -> std::result::Result<S::Ok, S::Error>
+    /// fn partial_escape<S>(s: &str, ser: S) -> Result<S::Ok, S::Error>
     /// where
     ///     S: serde::Serializer,
     /// {
@@ -475,4 +475,100 @@ pub struct CompleteMultipartUploadRequestPart {
     /// ref: <https://github.com/tafia/quick-xml/issues/362>
     #[serde(rename = "ETag")]
     pub etag: String,
+}
+
+#[derive(Default, Debug, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct ListObjectsOutput {
+    pub name: String,
+    pub prefix: String,
+    pub contents: Vec<ListObjectsOutputContent>,
+    pub common_prefixes: Vec<CommonPrefix>,
+    pub marker: String,
+    pub next_marker: Option<String>,
+}
+
+#[derive(Default, Debug, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct CommonPrefix {
+    pub prefix: String,
+}
+
+#[derive(Default, Debug, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct ListObjectsOutputContent {
+    pub key: String,
+    pub size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Buf;
+
+    use super::*;
+
+    #[test]
+    fn test_parse_xml() {
+        let bs = bytes::Bytes::from(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ListBucketResult xmlns="http://obs.cn-north-4.myhuaweicloud.com/doc/2015-06-30/">
+    <Name>examplebucket</Name>
+    <Prefix>obj</Prefix>
+    <Marker>obj002</Marker>
+    <NextMarker>obj004</NextMarker>
+    <MaxKeys>1000</MaxKeys>
+    <IsTruncated>false</IsTruncated>
+    <Contents>
+        <Key>obj002</Key>
+        <LastModified>2015-07-01T02:11:19.775Z</LastModified>
+        <ETag>"a72e382246ac83e86bd203389849e71d"</ETag>
+        <Size>9</Size>
+        <Owner>
+            <ID>b4bf1b36d9ca43d984fbcb9491b6fce9</ID>
+        </Owner>
+        <StorageClass>STANDARD</StorageClass>
+    </Contents>
+    <Contents>
+        <Key>obj003</Key>
+        <LastModified>2015-07-01T02:11:19.775Z</LastModified>
+        <ETag>"a72e382246ac83e86bd203389849e71d"</ETag>
+        <Size>10</Size>
+        <Owner>
+            <ID>b4bf1b36d9ca43d984fbcb9491b6fce9</ID>
+        </Owner>
+        <StorageClass>STANDARD</StorageClass>
+    </Contents>
+    <CommonPrefixes>
+        <Prefix>hello</Prefix>
+    </CommonPrefixes>
+    <CommonPrefixes>
+        <Prefix>world</Prefix>
+    </CommonPrefixes>
+</ListBucketResult>"#,
+        );
+        let out: ListObjectsOutput = quick_xml::de::from_reader(bs.reader()).expect("must success");
+
+        assert_eq!(out.name, "examplebucket".to_string());
+        assert_eq!(out.prefix, "obj".to_string());
+        assert_eq!(out.marker, "obj002".to_string());
+        assert_eq!(out.next_marker, Some("obj004".to_string()),);
+        assert_eq!(
+            out.contents
+                .iter()
+                .map(|v| v.key.clone())
+                .collect::<Vec<String>>(),
+            ["obj002", "obj003"],
+        );
+        assert_eq!(
+            out.contents.iter().map(|v| v.size).collect::<Vec<u64>>(),
+            [9, 10],
+        );
+        assert_eq!(
+            out.common_prefixes
+                .iter()
+                .map(|v| v.prefix.clone())
+                .collect::<Vec<String>>(),
+            ["hello", "world"],
+        )
+    }
 }

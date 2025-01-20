@@ -23,7 +23,11 @@ excludes = [
 
   # Well known generated files
   "**/Cargo.lock",
-  "**/yarn.lock",
+  "**/pnpm-lock.yaml",
+
+  # Generated files to list all dependencies
+  "**/DEPENDENCIES.*.tsv",
+  "**/DEPENDENCIES.*.csv",
 
   # Python binding related files
   "**/venv/**",
@@ -38,7 +42,5 @@ excludes = [
 
   # Test files
   "**/tests/data/**",
-
-  # Third-party source files
-  "scripts/merge_local_staging.sh",
+  "**/fixtures/data/**",
 ]

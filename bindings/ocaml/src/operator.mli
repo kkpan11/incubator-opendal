@@ -7,6 +7,13 @@ open! Bigarray
 type operator
 type reader
 type metadata
+type entry
+
+(* file: entry.rs *)
+
+external entry_path: entry -> string  = "entry_path"
+external entry_name: entry -> string  = "entry_name"
+external entry_metadata: entry -> metadata  = "entry_metadata"
 
 (* file: metadata.rs *)
 
@@ -22,6 +29,7 @@ external metadata_last_modified: metadata -> int64 option  = "metadata_last_modi
 (* file: mod.rs *)
 
 external operator: string -> (string * string) list -> (operator, string) Result.t  = "operator"
+external blocking_list: operator -> string -> (entry array, string) Result.t  = "blocking_list"
 external blocking_stat: operator -> string -> (metadata, string) Result.t  = "blocking_stat"
 external blocking_is_exist: operator -> string -> (bool, string) Result.t  = "blocking_is_exist"
 external blocking_create_dir: operator -> string -> (bool, string) Result.t  = "blocking_create_dir"
@@ -36,5 +44,4 @@ external blocking_remove_all: operator -> string -> (unit, string) Result.t  = "
 
 (* file: reader.rs *)
 
-external reader_read: reader -> bytes -> (int, string) Result.t  = "reader_read"
-external reader_seek: reader -> Seek_from.seek_from -> (int64, string) Result.t  = "reader_seek"
+external reader_pread: reader -> bytes -> int64 -> (int, string) Result.t  = "reader_pread"

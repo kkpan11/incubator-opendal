@@ -52,8 +52,12 @@ void Operator::write(std::string_view path, const std::vector<uint8_t> &data) {
       RUST_STR(path), rust::Slice<const uint8_t>(data.data(), data.size()));
 }
 
+bool Operator::exists(std::string_view path) {
+  return operator_.value()->exists(RUST_STR(path));
+}
+
 bool Operator::is_exist(std::string_view path) {
-  return operator_.value()->is_exist(RUST_STR(path));
+  return exists(path);
 }
 
 void Operator::create_dir(std::string_view path) {
@@ -157,13 +161,13 @@ std::optional<std::string> parse_optional_string(ffi::OptionalString &&s) {
 
 ffi::SeekDir to_rust_seek_dir(std::ios_base::seekdir dir) {
   switch (dir) {
-  case std::ios_base::beg:
-    return ffi::SeekDir::Start;
-  case std::ios_base::cur:
-    return ffi::SeekDir::Current;
-  case std::ios_base::end:
-    return ffi::SeekDir::End;
-  default:
-    throw std::runtime_error("invalid seekdir");
+    case std::ios_base::beg:
+      return ffi::SeekDir::Start;
+    case std::ios_base::cur:
+      return ffi::SeekDir::Current;
+    case std::ios_base::end:
+      return ffi::SeekDir::End;
+    default:
+      throw std::runtime_error("invalid seekdir");
   }
 }

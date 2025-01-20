@@ -31,8 +31,14 @@
     </parent>
 
     <groupId>org.apache.opendal</groupId>
-    <artifactId>opendal-java</artifactId>
-    <version>0.41.0</version>
+    <artifactId>opendal</artifactId>
+    <version>0.47.7</version>
+
+    <name>Apache OpenDAL™</name>
+    <description>
+        Apache OpenDAL™ is a data access layer that allows users to
+        easily and efficiently retrieve data from various storage services in a unified way.
+    </description>
 
     <url>https://opendal.apache.org</url>
     <mailingLists>
@@ -55,21 +61,26 @@
         <!-- customized properties -->
         <cargo-build.profile>dev</cargo-build.profile>
         <cargo-build.features>default</cargo-build.features>
+        <cargo-build.enableZigbuild>false</cargo-build.enableZigbuild>
         <cargo-build.target/> <!-- override cargo build target; e.g., use musl instead -->
         <jni.classifier>${os.detected.classifier}</jni.classifier>
 
         <!-- library dependencies -->
         <assertj.version>3.23.1</assertj.version>
+        <commons-io.version>2.16.1</commons-io.version>
         <dotenv.version>2.3.2</dotenv.version>
-        <lombok.version>1.18.30</lombok.version>
+        <lombok.version>1.18.34</lombok.version>
         <slf4j.version>2.0.7</slf4j.version>
+        <httpclient.version>5.2</httpclient.version>
 
         <!-- plugins dependencies -->
         <maven-surefire-plugin.version>3.1.2</maven-surefire-plugin.version>
+        <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
         <exec-maven-plugin.version>3.1.0</exec-maven-plugin.version>
         <os-maven-plugin.version>1.7.0</os-maven-plugin.version>
         <palantir-java-format.version>2.36.0</palantir-java-format.version>
         <spotless.version>2.39.0</spotless.version>
+        <maven-javadoc-plugin.version>3.6.3</maven-javadoc-plugin.version>
     </properties>
 
     <dependencyManagement>
@@ -100,6 +111,18 @@
                 <groupId>io.github.cdimascio</groupId>
                 <artifactId>dotenv-java</artifactId>
                 <version>${dotenv.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>commons-io</groupId>
+                <artifactId>commons-io</artifactId>
+                <version>${commons-io.version}</version>
+                <scope>test</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.httpcomponents.client5</groupId>
+                <artifactId>httpclient5</artifactId>
+                <version>${httpclient.version}</version>
+                <scope>test</scope>
             </dependency>
         </dependencies>
     </dependencyManagement>
@@ -134,6 +157,16 @@
         <dependency>
             <groupId>io.github.cdimascio</groupId>
             <artifactId>dotenv-java</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>commons-io</groupId>
+            <artifactId>commons-io</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.httpcomponents.client5</groupId>
+            <artifactId>httpclient5</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>
@@ -184,10 +217,26 @@
                                 <argument>${cargo-build.profile}</argument>
                                 <argument>--features</argument>
                                 <argument>${cargo-build.features}</argument>
+                                <argument>--enable-zigbuild</argument>
+                                <argument>${cargo-build.enableZigbuild}</argument>
                             </arguments>
                         </configuration>
                     </execution>
                 </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven-compiler-plugin.version}</version>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>${lombok.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -240,6 +289,18 @@
                         <trimTrailingWhitespace/>
                         <endWithNewline/>
                     </java>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-javadoc-plugin</artifactId>
+                <version>${maven-javadoc-plugin.version}</version>
+                <configuration>
+                    <bottom>
+                        Copyright © 2022-2024, The Apache Software Foundation. Apache OpenDAL, OpenDAL, and Apache
+                        are either registered trademarks or trademarks of the Apache Software Foundation.
+                    </bottom>
                 </configuration>
             </plugin>
         </plugins>

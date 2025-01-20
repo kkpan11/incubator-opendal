@@ -15,12 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Read;
-
-use bytes::Bytes;
-
 use super::operator_functions::*;
-use crate::raw::oio::WriteBuf;
+use crate::raw::oio::BlockingDelete;
 use crate::raw::*;
 use crate::*;
 
@@ -34,7 +30,7 @@ use crate::*;
 ///
 /// Read more backend init examples in [`services`]
 ///
-/// ```
+/// ```rust,no_run
 /// # use anyhow::Result;
 /// use opendal::services::Fs;
 /// use opendal::BlockingOperator;
@@ -42,11 +38,7 @@ use crate::*;
 ///
 /// fn main() -> Result<()> {
 ///     // Create fs backend builder.
-///     let mut builder = Fs::default();
-///     // Set the root for fs, all operations will happen under this root.
-///     //
-///     // NOTE: the root must be absolute path.
-///     builder.root("/tmp");
+///     let builder = Fs::default().root("/tmp");
 ///
 ///     // Build an `BlockingOperator` to start operating the storage.
 ///     let _: BlockingOperator = Operator::new(builder)?.finish().blocking();
@@ -59,20 +51,17 @@ use crate::*;
 ///
 /// Some services like s3, gcs doesn't have native blocking supports, we can use [`layers::BlockingLayer`]
 /// to wrap the async operator to make it blocking.
-///
-/// ```rust
+#[cfg_attr(feature = "layers-blocking", doc = "```rust")]
+#[cfg_attr(not(feature = "layers-blocking"), doc = "```ignore")]
 /// # use anyhow::Result;
 /// use opendal::layers::BlockingLayer;
 /// use opendal::services::S3;
 /// use opendal::BlockingOperator;
 /// use opendal::Operator;
 ///
-/// #[tokio::main]
-/// async fn main() -> Result<()> {
+/// async fn test() -> Result<()> {
 ///     // Create fs backend builder.
-///     let mut builder = S3::default();
-///     builder.bucket("test");
-///     builder.region("us-east-1");
+///     let mut builder = S3::default().bucket("test").region("us-east-1");
 ///
 ///     // Build an `BlockingOperator` with blocking layer to start operating the storage.
 ///     let _: BlockingOperator = Operator::new(builder)?
@@ -85,13 +74,11 @@ use crate::*;
 /// ```
 #[derive(Clone, Debug)]
 pub struct BlockingOperator {
-    accessor: FusedAccessor,
-
-    limit: usize,
+    accessor: Accessor,
 }
 
 impl BlockingOperator {
-    pub(super) fn inner(&self) -> &FusedAccessor {
+    pub(super) fn inner(&self) -> &Accessor {
         &self.accessor
     }
 
@@ -99,27 +86,22 @@ impl BlockingOperator {
     ///
     /// # Note
     /// default batch limit is 1000.
-    pub(crate) fn from_inner(accessor: FusedAccessor) -> Self {
-        let limit = accessor
-            .info()
-            .full_capability()
-            .batch_max_operations
-            .unwrap_or(1000);
-        Self { accessor, limit }
+    pub(crate) fn from_inner(accessor: Accessor) -> Self {
+        Self { accessor }
     }
 
     /// Get current operator's limit
+    #[deprecated(note = "limit is no-op for now", since = "0.52.0")]
     pub fn limit(&self) -> usize {
-        self.limit
+        0
     }
 
     /// Specify the batch limit.
     ///
     /// Default: 1000
-    pub fn with_limit(&self, limit: usize) -> Self {
-        let mut op = self.clone();
-        op.limit = limit;
-        op
+    #[deprecated(note = "limit is no-op for now", since = "0.52.0")]
+    pub fn with_limit(&self, _: usize) -> Self {
+        self.clone()
     }
 
     /// Get information of underlying accessor.
@@ -143,15 +125,37 @@ impl BlockingOperator {
 
 /// # Operator blocking API.
 impl BlockingOperator {
-    /// Get current path's metadata.
+    /// Get given path's metadata.
     ///
-    /// # Notes
+    /// # Behavior
     ///
-    /// For fetch metadata of entries returned by [`Lister`], it's better to use [`list_with`] and
-    /// [`lister_with`] with `metakey` query like `Metakey::ContentLength | Metakey::LastModified`
-    /// so that we can avoid extra requests.
+    /// ## Services that support `create_dir`
+    ///
+    /// `test` and `test/` may vary in some services such as S3. However, on a local file system,
+    /// they're identical. Therefore, the behavior of `stat("test")` and `stat("test/")` might differ
+    /// in certain edge cases. Always use `stat("test/")` when you need to access a directory if possible.
+    ///
+    /// Here are the behavior list:
+    ///
+    /// | Case                   | Path            | Result                                     |
+    /// |------------------------|-----------------|--------------------------------------------|
+    /// | stat existing dir      | `abc/`          | Metadata with dir mode                     |
+    /// | stat existing file     | `abc/def_file`  | Metadata with file mode                    |
+    /// | stat dir without `/`   | `abc/def_dir`   | Error `NotFound` or metadata with dir mode |
+    /// | stat file with `/`     | `abc/def_file/` | Error `NotFound`                           |
+    /// | stat not existing path | `xyz`           | Error `NotFound`                           |
+    ///
+    /// Refer to [RFC: List Prefix][crate::docs::rfcs::rfc_3243_list_prefix] for more details.
+    ///
+    /// ## Services that not support `create_dir`
+    ///
+    /// For services that not support `create_dir`, `stat("test/")` will return `NotFound` even
+    /// when `test/abc` exists since the service won't have the concept of dir. There is nothing
+    /// we can do about this.
     ///
     /// # Examples
+    ///
+    /// ## Check if file exists
     ///
     /// ```
     /// # use anyhow::Result;
@@ -172,29 +176,55 @@ impl BlockingOperator {
         self.stat_with(path).call()
     }
 
-    /// Get current path's metadata **without cache** directly with extra options.
+    /// Get given path's metadata with extra options.
     ///
-    /// # Notes
+    /// # Behavior
     ///
-    /// Use `stat` if you:
+    /// ## Services that support `create_dir`
     ///
-    /// - Want to detect the outside changes of path.
-    /// - Don't want to read from cached metadata.
+    /// `test` and `test/` may vary in some services such as S3. However, on a local file system,
+    /// they're identical. Therefore, the behavior of `stat("test")` and `stat("test/")` might differ
+    /// in certain edge cases. Always use `stat("test/")` when you need to access a directory if possible.
     ///
-    /// You may want to use `metadata` if you are working with entries
-    /// returned by [`Lister`]. It's highly possible that metadata
-    /// you want has already been cached.
+    /// Here are the behavior list:
+    ///
+    /// | Case                   | Path            | Result                                     |
+    /// |------------------------|-----------------|--------------------------------------------|
+    /// | stat existing dir      | `abc/`          | Metadata with dir mode                     |
+    /// | stat existing file     | `abc/def_file`  | Metadata with file mode                    |
+    /// | stat dir without `/`   | `abc/def_dir`   | Error `NotFound` or metadata with dir mode |
+    /// | stat file with `/`     | `abc/def_file/` | Error `NotFound`                           |
+    /// | stat not existing path | `xyz`           | Error `NotFound`                           |
+    ///
+    /// Refer to [RFC: List Prefix][crate::docs::rfcs::rfc_3243_list_prefix] for more details.
+    ///
+    /// ## Services that not support `create_dir`
+    ///
+    /// For services that not support `create_dir`, `stat("test/")` will return `NotFound` even
+    /// when `test/abc` exists since the service won't have the concept of dir. There is nothing
+    /// we can do about this.
     ///
     /// # Examples
+    ///
+    /// ## Get metadata while `ETag` matches
+    ///
+    /// `stat_with` will
+    ///
+    /// - return `Ok(metadata)` if `ETag` matches
+    /// - return `Err(error)` and `error.kind() == ErrorKind::ConditionNotMatch` if file exists but
+    ///   `ETag` mismatch
+    /// - return `Err(err)` if other errors occur, for example, `NotFound`.
     ///
     /// ```
     /// # use anyhow::Result;
     /// # use opendal::BlockingOperator;
     /// use opendal::ErrorKind;
     /// #
-    /// # #[tokio::main]
-    /// # async fn test(op: BlockingOperator) -> Result<()> {
+    /// # fn test(op: BlockingOperator) -> Result<()> {
     /// if let Err(e) = op.stat_with("test").if_match("<etag>").call() {
+    ///     if e.kind() == ErrorKind::ConditionNotMatch {
+    ///         println!("file exists, but etag mismatch")
+    ///     }
     ///     if e.kind() == ErrorKind::NotFound {
     ///         println!("file not exist")
     ///     }
@@ -226,12 +256,12 @@ impl BlockingOperator {
     /// use anyhow::Result;
     /// use opendal::BlockingOperator;
     /// fn test(op: BlockingOperator) -> Result<()> {
-    ///     let _ = op.is_exist("test")?;
+    ///     let _ = op.exists("test")?;
     ///
     ///     Ok(())
     /// }
     /// ```
-    pub fn is_exist(&self, path: &str) -> Result<bool> {
+    pub fn exists(&self, path: &str) -> Result<bool> {
         let r = self.stat(path);
         match r {
             Ok(_) => Ok(true),
@@ -240,6 +270,24 @@ impl BlockingOperator {
                 _ => Err(err),
             },
         }
+    }
+
+    /// Check if this path exists or not.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use anyhow::Result;
+    /// use opendal::BlockingOperator;
+    /// fn test(op: BlockingOperator) -> Result<()> {
+    ///     let _ = op.is_exist("test")?;
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[deprecated(note = "rename to `exists` for consistence with `std::fs::exists`")]
+    pub fn is_exist(&self, path: &str) -> Result<bool> {
+        self.exists(path)
     }
 
     /// Create a dir at given path.
@@ -258,7 +306,7 @@ impl BlockingOperator {
     /// # Examples
     ///
     /// ```no_run
-    /// # use std::io::Result;
+    /// # use opendal::Result;
     /// # use opendal::BlockingOperator;
     /// # use futures::TryStreamExt;
     /// # fn test(op: BlockingOperator) -> Result<()> {
@@ -293,7 +341,7 @@ impl BlockingOperator {
     /// # Examples
     ///
     /// ```no_run
-    /// # use std::io::Result;
+    /// # use opendal::Result;
     /// # use opendal::BlockingOperator;
     /// #
     /// # fn test(op: BlockingOperator) -> Result<()> {
@@ -301,7 +349,7 @@ impl BlockingOperator {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn read(&self, path: &str) -> Result<Vec<u8>> {
+    pub fn read(&self, path: &str) -> Result<Buffer> {
         self.read_with(path).call()
     }
 
@@ -316,7 +364,6 @@ impl BlockingOperator {
     /// # use anyhow::Result;
     /// use opendal::BlockingOperator;
     /// use opendal::EntryMode;
-    /// use opendal::Metakey;
     /// # fn test(op: BlockingOperator) -> Result<()> {
     /// let bs = op.read_with("path/to/file").range(0..10).call()?;
     /// # Ok(())
@@ -328,8 +375,8 @@ impl BlockingOperator {
         FunctionRead(OperatorFunction::new(
             self.inner().clone(),
             path,
-            OpRead::default(),
-            |inner, path, args| {
+            (OpRead::default(), BytesRange::default()),
+            |inner, path, (args, range)| {
                 if !validate_path(&path, EntryMode::FILE) {
                     return Err(
                         Error::new(ErrorKind::IsADirectory, "read path is a directory")
@@ -339,22 +386,10 @@ impl BlockingOperator {
                     );
                 }
 
-                let (rp, mut s) = inner.blocking_read(&path, args)?;
-                let mut buffer = Vec::with_capacity(rp.into_metadata().content_length() as usize);
-
-                match s.read_to_end(&mut buffer) {
-                    Ok(n) => {
-                        buffer.truncate(n);
-                        Ok(buffer)
-                    }
-                    Err(err) => Err(
-                        Error::new(ErrorKind::Unexpected, "blocking read_with failed")
-                            .with_operation("BlockingOperator::read_with")
-                            .with_context("service", inner.info().scheme().into_static())
-                            .with_context("path", &path)
-                            .set_source(err),
-                    ),
-                }
+                let context = ReadContext::new(inner, path, args, OpReader::default());
+                let r = BlockingReader::new(context);
+                let buf = r.read(range.to_range())?;
+                Ok(buf)
             },
         ))
     }
@@ -364,7 +399,7 @@ impl BlockingOperator {
     /// # Examples
     ///
     /// ```no_run
-    /// # use std::io::Result;
+    /// # use opendal::Result;
     /// # use opendal::BlockingOperator;
     /// # use futures::TryStreamExt;
     /// # fn test(op: BlockingOperator) -> Result<()> {
@@ -384,9 +419,11 @@ impl BlockingOperator {
     /// # use anyhow::Result;
     /// use opendal::BlockingOperator;
     /// use opendal::EntryMode;
-    /// use opendal::Metakey;
     /// # fn test(op: BlockingOperator) -> Result<()> {
-    /// let r = op.reader_with("path/to/file").range(0..10).call()?;
+    /// let r = op
+    ///     .reader_with("path/to/file")
+    ///     .version("version_id")
+    ///     .call()?;
     /// # Ok(())
     /// # }
     /// ```
@@ -407,7 +444,8 @@ impl BlockingOperator {
                     );
                 }
 
-                BlockingReader::create(inner.clone(), &path, args)
+                let context = ReadContext::new(inner, path, args, OpReader::default());
+                Ok(BlockingReader::new(context))
             },
         ))
     }
@@ -421,7 +459,7 @@ impl BlockingOperator {
     /// # Examples
     ///
     /// ```no_run
-    /// # use std::io::Result;
+    /// # use opendal::Result;
     /// # use opendal::BlockingOperator;
     /// # use futures::StreamExt;
     /// # use futures::SinkExt;
@@ -432,7 +470,7 @@ impl BlockingOperator {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn write(&self, path: &str, bs: impl Into<Bytes>) -> Result<()> {
+    pub fn write(&self, path: &str, bs: impl Into<Buffer>) -> Result<()> {
         self.write_with(path, bs).call()
     }
 
@@ -448,7 +486,7 @@ impl BlockingOperator {
     /// # Examples
     ///
     /// ```
-    /// # use std::io::Result;
+    /// # use opendal::Result;
     /// # use opendal::BlockingOperator;
     ///
     /// # fn test(op: BlockingOperator) -> Result<()> {
@@ -505,7 +543,7 @@ impl BlockingOperator {
     /// # Examples
     ///
     /// ```
-    /// # use std::io::Result;
+    /// # use opendal::Result;
     /// # use opendal::BlockingOperator;
     ///
     /// # fn test(op: BlockingOperator) -> Result<()> {
@@ -551,7 +589,7 @@ impl BlockingOperator {
         Ok(())
     }
 
-    /// Write data with option described in OpenDAL [RFC-0661][`crate::docs::rfcs::rfc_0661_path_in_accessor`]
+    /// Write data with options.
     ///
     /// # Notes
     ///
@@ -573,7 +611,7 @@ impl BlockingOperator {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn write_with(&self, path: &str, bs: impl Into<Bytes>) -> FunctionWrite {
+    pub fn write_with(&self, path: &str, bs: impl Into<Buffer>) -> FunctionWrite {
         let path = normalize_path(path);
 
         let bs = bs.into();
@@ -581,8 +619,8 @@ impl BlockingOperator {
         FunctionWrite(OperatorFunction::new(
             self.inner().clone(),
             path,
-            (OpWrite::default(), bs),
-            |inner, path, (args, mut bs)| {
+            (OpWrite::default(), OpWriter::default(), bs),
+            |inner, path, (args, options, bs)| {
                 if !validate_path(&path, EntryMode::FILE) {
                     return Err(
                         Error::new(ErrorKind::IsADirectory, "write path is a directory")
@@ -592,13 +630,10 @@ impl BlockingOperator {
                     );
                 }
 
-                let (_, mut w) = inner.blocking_write(&path, args)?;
-                while bs.remaining() > 0 {
-                    let n = w.write(&bs)?;
-                    bs.advance(n);
-                }
+                let context = WriteContext::new(inner, path, args, options);
+                let mut w = BlockingWriter::new(context)?;
+                w.write(bs)?;
                 w.close()?;
-
                 Ok(())
             },
         ))
@@ -613,7 +648,7 @@ impl BlockingOperator {
     /// # Examples
     ///
     /// ```no_run
-    /// # use std::io::Result;
+    /// # use opendal::Result;
     /// # use opendal::BlockingOperator;
     /// # use futures::StreamExt;
     /// # use futures::SinkExt;
@@ -639,7 +674,6 @@ impl BlockingOperator {
     /// # use anyhow::Result;
     /// use opendal::BlockingOperator;
     /// use opendal::EntryMode;
-    /// use opendal::Metakey;
     /// # fn test(op: BlockingOperator) -> Result<()> {
     /// let mut w = op.writer_with("path/to/file").call()?;
     /// w.write(vec![0; 4096])?;
@@ -654,8 +688,8 @@ impl BlockingOperator {
         FunctionWriter(OperatorFunction::new(
             self.inner().clone(),
             path,
-            OpWrite::default(),
-            |inner, path, args| {
+            (OpWrite::default(), OpWriter::default()),
+            |inner, path, (args, options)| {
                 let path = normalize_path(&path);
 
                 if !validate_path(&path, EntryMode::FILE) {
@@ -667,7 +701,9 @@ impl BlockingOperator {
                     );
                 }
 
-                BlockingWriter::create(inner.clone(), &path, args)
+                let context = WriteContext::new(inner, path, args, options);
+                let w = BlockingWriter::new(context)?;
+                Ok(w)
             },
         ))
     }
@@ -723,11 +759,54 @@ impl BlockingOperator {
             path,
             OpDelete::new(),
             |inner, path, args| {
-                let _ = inner.blocking_delete(&path, args)?;
+                let (_, mut deleter) = inner.blocking_delete()?;
+                deleter.delete(&path, args)?;
+                deleter.flush()?;
 
                 Ok(())
             },
         ))
+    }
+
+    /// Delete an infallible iterator of paths.
+    ///
+    /// Also see:
+    ///
+    /// - [`BlockingOperator::delete_try_iter`]: delete an fallible iterator of paths.
+    pub fn delete_iter<I, D>(&self, iter: I) -> Result<()>
+    where
+        I: IntoIterator<Item = D>,
+        D: IntoDeleteInput,
+    {
+        let mut deleter = self.deleter()?;
+        deleter.delete_iter(iter)?;
+        deleter.close()?;
+        Ok(())
+    }
+
+    /// Delete a fallible iterator of paths.
+    ///
+    /// Also see:
+    ///
+    /// - [`BlockingOperator::delete_iter`]: delete an infallible iterator of paths.
+    pub fn delete_try_iter<I, D>(&self, try_iter: I) -> Result<()>
+    where
+        I: IntoIterator<Item = Result<D>>,
+        D: IntoDeleteInput,
+    {
+        let mut deleter = self.deleter()?;
+        deleter.delete_try_iter(try_iter)?;
+        deleter.close()?;
+        Ok(())
+    }
+
+    /// Create a [`BlockingDeleter`] to continuously remove content from storage.
+    ///
+    /// It leverages batch deletion capabilities provided by storage services for efficient removal.
+    ///
+    /// Users can have more control over the deletion process by using [`BlockingDeleter`] directly.
+    pub fn deleter(&self) -> Result<BlockingDeleter> {
+        BlockingDeleter::create(self.inner().clone())
     }
 
     /// remove will remove files via the given paths.
@@ -750,6 +829,7 @@ impl BlockingOperator {
     /// # Ok(())
     /// # }
     /// ```
+    #[deprecated(note = "use `BlockingOperator::delete_iter` instead", since = "0.52.0")]
     pub fn remove_via(&self, input: impl Iterator<Item = String>) -> Result<()> {
         for path in input {
             self.delete(&path)?;
@@ -772,10 +852,9 @@ impl BlockingOperator {
     /// # Ok(())
     /// # }
     /// ```
+    #[deprecated(note = "use `BlockingOperator::delete_iter` instead", since = "0.52.0")]
     pub fn remove(&self, paths: Vec<String>) -> Result<()> {
-        self.remove_via(paths.into_iter())?;
-
-        Ok(())
+        self.delete_iter(paths)
     }
 
     /// Remove the path and all nested dirs and files recursively.
@@ -796,47 +875,38 @@ impl BlockingOperator {
     /// # }
     /// ```
     pub fn remove_all(&self, path: &str) -> Result<()> {
-        let meta = match self.stat(path) {
-            Ok(metadata) => metadata,
+        match self.stat(path) {
+            Ok(metadata) => {
+                if metadata.mode() != EntryMode::DIR {
+                    self.delete(path)?;
+                    // There may still be objects prefixed with the path in some backend, so we can't return here.
+                }
+            }
 
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            // If dir not found, it may be a prefix in object store like S3,
+            // and we still need to delete objects under the prefix.
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
 
             Err(e) => return Err(e),
         };
 
-        if meta.mode() != EntryMode::DIR {
-            return self.delete(path);
-        }
-
-        let obs = self.lister_with(path).delimiter("").call()?;
-
-        for v in obs {
-            match v {
-                Ok(entry) => {
-                    self.inner()
-                        .blocking_delete(entry.path(), OpDelete::new())?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Remove the directory itself.
-        self.delete(path)?;
+        let lister = self.lister_with(path).recursive(true).call()?;
+        self.delete_try_iter(lister)?;
 
         Ok(())
     }
 
-    /// List entries within a given directory.
+    /// List entries that starts with given `path` in parent dir.
     ///
     /// # Notes
     ///
-    /// ## Listing recursively
+    /// ## Recursively List
     ///
     /// This function only read the children of the given directory. To read
-    /// all entries recursively, use `BlockingOperator::list_with("path").delimiter("")`
+    /// all entries recursively, use `BlockingOperator::list_with("path").recursive(true)`
     /// instead.
     ///
-    /// ## Streaming
+    /// ## Streaming List
     ///
     /// This function will read all entries in the given directory. It could
     /// take very long time and consume a lot of memory if the directory
@@ -845,18 +915,12 @@ impl BlockingOperator {
     /// In order to avoid this, you can use [`BlockingOperator::lister`] to list entries in
     /// a streaming way.
     ///
-    /// ## Metadata
-    ///
-    /// The only metadata that is guaranteed to be available is the `Mode`.
-    /// For fetching more metadata, please use [`BlockingOperator::list_with`] and `metakey`.
-    ///
     /// # Examples
     ///
     /// ```no_run
     /// # use anyhow::Result;
     /// use opendal::BlockingOperator;
     /// use opendal::EntryMode;
-    /// use opendal::Metakey;
     /// #  fn test(op: BlockingOperator) -> Result<()> {
     /// let mut entries = op.list("path/to/dir/")?;
     /// for entry in entries {
@@ -877,23 +941,18 @@ impl BlockingOperator {
         self.list_with(path).call()
     }
 
-    /// List entries within a given directory with options.
+    /// List entries that starts with given `path` in parent dir. with options.
     ///
     /// # Notes
     ///
-    /// ## For streaming
+    /// ## Streaming List
     ///
     /// This function will read all entries in the given directory. It could
     /// take very long time and consume a lot of memory if the directory
     /// contains a lot of entries.
     ///
-    /// In order to avoid this, you can use [`Operator::lister`] to list entries in
+    /// In order to avoid this, you can use [`BlockingOperator::lister`] to list entries in
     /// a streaming way.
-    ///
-    /// ## Metadata
-    ///
-    /// The only metadata that is guaranteed to be available is the `Mode`.
-    /// For fetching more metadata, please specify the `metakey`.
     ///
     /// # Examples
     ///
@@ -905,9 +964,8 @@ impl BlockingOperator {
     /// # use anyhow::Result;
     /// use opendal::BlockingOperator;
     /// use opendal::EntryMode;
-    /// use opendal::Metakey;
     /// # fn test(op: BlockingOperator) -> Result<()> {
-    /// let mut entries = op.list_with("prefix/").delimiter("").call()?;
+    /// let mut entries = op.list_with("prefix/").recursive(true).call()?;
     /// for entry in entries {
     ///     match entry.metadata().mode() {
     ///         EntryMode::FILE => {
@@ -915,38 +973,6 @@ impl BlockingOperator {
     ///         }
     ///         EntryMode::DIR => {
     ///             println!("Handling dir like start a new list via meta.path()")
-    ///         }
-    ///         EntryMode::Unknown => continue,
-    ///     }
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// ## List entries with metakey for more metadata
-    ///
-    /// ```no_run
-    /// # use anyhow::Result;
-    /// use opendal::BlockingOperator;
-    /// use opendal::EntryMode;
-    /// use opendal::Metakey;
-    /// # fn test(op: BlockingOperator) -> Result<()> {
-    /// let mut entries = op
-    ///     .list_with("dir/")
-    ///     .metakey(Metakey::ContentLength | Metakey::LastModified)
-    ///     .call()?;
-    /// for entry in entries {
-    ///     let meta = entry.metadata();
-    ///     match meta.mode() {
-    ///         EntryMode::FILE => {
-    ///             println!(
-    ///                 "Handling file {} with size {}",
-    ///                 entry.path(),
-    ///                 meta.content_length()
-    ///             )
-    ///         }
-    ///         EntryMode::DIR => {
-    ///             println!("Handling dir {}", entry.path())
     ///         }
     ///         EntryMode::Unknown => continue,
     ///     }
@@ -962,16 +988,6 @@ impl BlockingOperator {
             path,
             OpList::default(),
             |inner, path, args| {
-                if !validate_path(&path, EntryMode::DIR) {
-                    return Err(Error::new(
-                        ErrorKind::NotADirectory,
-                        "the path trying to list should end with `/`",
-                    )
-                    .with_operation("BlockingOperator::list")
-                    .with_context("service", inner.info().scheme().into_static())
-                    .with_context("path", &path));
-                }
-
                 let lister = BlockingLister::create(inner, &path, args)?;
 
                 lister.collect()
@@ -979,24 +995,18 @@ impl BlockingOperator {
         ))
     }
 
-    /// List entries within a given directory as an iterator.
+    /// List entries that starts with given `path` in parent dir.
     ///
-    /// This function will create a new handle to list entries.
-    ///
-    /// An error will be returned if given path doesn't end with `/`.
+    /// This function will create a new [`BlockingLister`] to list entries. Users can stop listing
+    /// via dropping this [`Lister`].
     ///
     /// # Notes
     ///
-    /// ## Listing recursively
+    /// ## Recursively List
     ///
     /// This function only read the children of the given directory. To read
     /// all entries recursively, use [`BlockingOperator::lister_with`] and `delimiter("")`
     /// instead.
-    ///
-    /// ## Metadata
-    ///
-    /// The only metadata that is guaranteed to be available is the `Mode`.
-    /// For fetching more metadata, please use [`BlockingOperator::lister_with`] and `metakey`.
     ///
     /// # Examples
     ///
@@ -1006,7 +1016,6 @@ impl BlockingOperator {
     /// use futures::TryStreamExt;
     /// use opendal::BlockingOperator;
     /// use opendal::EntryMode;
-    /// use opendal::Metakey;
     /// # fn test(op: BlockingOperator) -> Result<()> {
     /// let mut ds = op.lister("path/to/dir/")?;
     /// for de in ds {
@@ -1044,7 +1053,6 @@ impl BlockingOperator {
     /// use futures::TryStreamExt;
     /// use opendal::BlockingOperator;
     /// use opendal::EntryMode;
-    /// use opendal::Metakey;
     /// # fn test(op: BlockingOperator) -> Result<()> {
     /// let mut ds = op
     ///     .lister_with("path/to/dir/")
@@ -1075,49 +1083,13 @@ impl BlockingOperator {
     /// use futures::TryStreamExt;
     /// use opendal::BlockingOperator;
     /// use opendal::EntryMode;
-    /// use opendal::Metakey;
     /// # fn test(op: BlockingOperator) -> Result<()> {
-    /// let mut ds = op.lister_with("path/to/dir/").delimiter("").call()?;
+    /// let mut ds = op.lister_with("path/to/dir/").recursive(true).call()?;
     /// for entry in ds {
     ///     let entry = entry?;
     ///     match entry.metadata().mode() {
     ///         EntryMode::FILE => {
     ///             println!("Handling file {}", entry.path())
-    ///         }
-    ///         EntryMode::DIR => {
-    ///             println!("Handling dir {}", entry.path())
-    ///         }
-    ///         EntryMode::Unknown => continue,
-    ///     }
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// ## List files with required metadata
-    ///
-    /// ```no_run
-    /// # use anyhow::Result;
-    /// # use futures::io;
-    /// use futures::TryStreamExt;
-    /// use opendal::BlockingOperator;
-    /// use opendal::EntryMode;
-    /// use opendal::Metakey;
-    /// # fn test(op: BlockingOperator) -> Result<()> {
-    /// let mut ds = op
-    ///     .lister_with("path/to/dir/")
-    ///     .metakey(Metakey::ContentLength | Metakey::LastModified)
-    ///     .call()?;
-    /// for entry in ds {
-    ///     let entry = entry?;
-    ///     let meta = entry.metadata();
-    ///     match meta.mode() {
-    ///         EntryMode::FILE => {
-    ///             println!(
-    ///                 "Handling file {} with size {}",
-    ///                 entry.path(),
-    ///                 meta.content_length()
-    ///             )
     ///         }
     ///         EntryMode::DIR => {
     ///             println!("Handling dir {}", entry.path())
@@ -1135,19 +1107,13 @@ impl BlockingOperator {
             self.inner().clone(),
             path,
             OpList::default(),
-            |inner, path, args| {
-                if !validate_path(&path, EntryMode::DIR) {
-                    return Err(Error::new(
-                        ErrorKind::NotADirectory,
-                        "the path trying to list should end with `/`",
-                    )
-                    .with_operation("BlockingOperator::list")
-                    .with_context("service", inner.info().scheme().into_static())
-                    .with_context("path", &path));
-                }
-
-                BlockingLister::create(inner, &path, args)
-            },
+            |inner, path, args| BlockingLister::create(inner, &path, args),
         ))
+    }
+}
+
+impl From<BlockingOperator> for Operator {
+    fn from(v: BlockingOperator) -> Self {
+        Operator::from_inner(v.accessor)
     }
 }

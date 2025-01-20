@@ -15,15 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 
-use async_trait::async_trait;
 use atomic_lib::agents::Agent;
 use atomic_lib::client::get_authentication_headers;
 use atomic_lib::commit::sign_message;
-use bytes::Bytes;
+use bytes::Buf;
 use http::header::CONTENT_DISPOSITION;
 use http::header::CONTENT_TYPE;
 use http::Request;
@@ -31,47 +29,47 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::raw::adapters::kv;
-use crate::raw::new_json_deserialize_error;
-use crate::raw::new_json_serialize_error;
-use crate::raw::new_request_build_error;
-use crate::raw::normalize_path;
-use crate::raw::normalize_root;
-use crate::raw::percent_encode_path;
-use crate::raw::AsyncBody;
-use crate::raw::FormDataPart;
-use crate::raw::HttpClient;
-use crate::raw::Multipart;
-use crate::Builder;
-use crate::Scheme;
+use crate::raw::*;
+use crate::services::AtomicserverConfig;
 use crate::*;
 
-/// Atomicserver service support.
+impl Configurator for AtomicserverConfig {
+    type Builder = AtomicserverBuilder;
+    fn into_builder(self) -> Self::Builder {
+        AtomicserverBuilder { config: self }
+    }
+}
+
 #[doc = include_str!("docs.md")]
 #[derive(Default)]
 pub struct AtomicserverBuilder {
-    root: Option<String>,
-    endpoint: Option<String>,
-    private_key: Option<String>,
-    public_key: Option<String>,
-    parent_resource_id: Option<String>,
+    config: AtomicserverConfig,
+}
+
+impl Debug for AtomicserverBuilder {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtomicserverBuilder")
+            .field("config", &self.config)
+            .finish()
+    }
 }
 
 impl AtomicserverBuilder {
     /// Set the root for Atomicserver.
-    pub fn root(&mut self, path: &str) -> &mut Self {
-        self.root = Some(path.into());
+    pub fn root(mut self, path: &str) -> Self {
+        self.config.root = Some(path.into());
         self
     }
 
     /// Set the server address for Atomicserver.
-    pub fn endpoint(&mut self, endpoint: &str) -> &mut Self {
-        self.endpoint = Some(endpoint.into());
+    pub fn endpoint(mut self, endpoint: &str) -> Self {
+        self.config.endpoint = Some(endpoint.into());
         self
     }
 
     /// Set the private key for agent used for Atomicserver.
-    pub fn private_key(&mut self, private_key: &str) -> &mut Self {
-        self.private_key = Some(private_key.into());
+    pub fn private_key(mut self, private_key: &str) -> Self {
+        self.config.private_key = Some(private_key.into());
         self
     }
 
@@ -79,50 +77,42 @@ impl AtomicserverBuilder {
     /// For example, if the subject URL for the agent being used
     /// is ${endpoint}/agents/lTB+W3C/2YfDu9IAVleEy34uCmb56iXXuzWCKBVwdRI=
     /// Then the required public key is `lTB+W3C/2YfDu9IAVleEy34uCmb56iXXuzWCKBVwdRI=`
-    pub fn public_key(&mut self, public_key: &str) -> &mut Self {
-        self.public_key = Some(public_key.into());
+    pub fn public_key(mut self, public_key: &str) -> Self {
+        self.config.public_key = Some(public_key.into());
         self
     }
 
     /// Set the parent resource id (url) that Atomicserver uses to store resources under.
-    pub fn parent_resource_id(&mut self, parent_resource_id: &str) -> &mut Self {
-        self.parent_resource_id = Some(parent_resource_id.into());
+    pub fn parent_resource_id(mut self, parent_resource_id: &str) -> Self {
+        self.config.parent_resource_id = Some(parent_resource_id.into());
         self
     }
 }
 
 impl Builder for AtomicserverBuilder {
     const SCHEME: Scheme = Scheme::Atomicserver;
-    type Accessor = AtomicserverBackend;
+    type Config = AtomicserverConfig;
 
-    fn from_map(map: HashMap<String, String>) -> Self {
-        let mut builder = AtomicserverBuilder::default();
-
-        map.get("root").map(|v| builder.root(v));
-        map.get("endpoint").map(|v| builder.endpoint(v));
-        map.get("private_key").map(|v| builder.private_key(v));
-        map.get("public_key").map(|v| builder.public_key(v));
-        map.get("parent_resource_id")
-            .map(|v| builder.parent_resource_id(v));
-
-        builder
-    }
-
-    fn build(&mut self) -> Result<Self::Accessor> {
+    fn build(self) -> Result<impl Access> {
         let root = normalize_root(
-            self.root
+            self.config
+                .root
                 .clone()
                 .unwrap_or_else(|| "/".to_string())
                 .as_str(),
         );
 
-        let endpoint = self.endpoint.clone().unwrap();
-        let parent_resource_id = self.parent_resource_id.clone().unwrap();
+        let endpoint = self.config.endpoint.clone().unwrap();
+        let parent_resource_id = self.config.parent_resource_id.clone().unwrap();
 
         let agent = Agent {
-            private_key: self.private_key.clone(),
-            public_key: self.public_key.clone().unwrap(),
-            subject: format!("{}/agents/{}", endpoint, self.public_key.clone().unwrap()),
+            private_key: self.config.private_key.clone(),
+            public_key: self.config.public_key.clone().unwrap(),
+            subject: format!(
+                "{}/agents/{}",
+                endpoint,
+                self.config.public_key.clone().unwrap()
+            ),
             created_at: 1,
             name: Some("agent".to_string()),
         };
@@ -136,7 +126,7 @@ impl Builder for AtomicserverBuilder {
                     .with_context("service", Scheme::Atomicserver)
             })?,
         })
-        .with_root(&root))
+        .with_normalized_root(root))
     }
 }
 
@@ -233,7 +223,7 @@ impl Adapter {
 }
 
 impl Adapter {
-    pub fn atomic_get_object_request(&self, path: &str) -> Result<Request<AsyncBody>> {
+    pub fn atomic_get_object_request(&self, path: &str) -> Result<Request<Buffer>> {
         let path = normalize_path(path);
         let path = path.as_str();
 
@@ -249,18 +239,12 @@ impl Adapter {
         req = self.sign(&url, req);
         req = req.header(http::header::ACCEPT, "application/ad+json");
 
-        let req = req
-            .body(AsyncBody::Empty)
-            .map_err(new_request_build_error)?;
+        let req = req.body(Buffer::new()).map_err(new_request_build_error)?;
 
         Ok(req)
     }
 
-    async fn atomic_post_object_request(
-        &self,
-        path: &str,
-        value: &[u8],
-    ) -> Result<Request<AsyncBody>> {
+    fn atomic_post_object_request(&self, path: &str, value: Buffer) -> Result<Request<Buffer>> {
         let path = normalize_path(path);
         let path = path.as_str();
 
@@ -289,7 +273,7 @@ impl Adapter {
         Ok(req)
     }
 
-    pub fn atomic_delete_object_request(&self, subject: &str) -> Result<Request<AsyncBody>> {
+    pub fn atomic_delete_object_request(&self, subject: &str) -> Result<Request<Buffer>> {
         let url = format!("{}/commit", self.endpoint);
 
         let timestamp = std::time::SystemTime::now()
@@ -328,21 +312,17 @@ impl Adapter {
 
         let body_bytes = body_string.as_bytes().to_owned();
         let req = req
-            .body(AsyncBody::Bytes(body_bytes.into()))
+            .body(Buffer::from(body_bytes))
             .map_err(new_request_build_error)?;
 
         Ok(req)
     }
 
-    pub async fn download_from_url(&self, download_url: &String) -> Result<Bytes> {
+    pub async fn download_from_url(&self, download_url: &String) -> Result<Buffer> {
         let req = Request::get(download_url);
-        let req = req
-            .body(AsyncBody::Empty)
-            .map_err(new_request_build_error)?;
+        let req = req.body(Buffer::new()).map_err(new_request_build_error)?;
         let resp = self.client.send(req).await?;
-        let bytes_file = resp.into_body().bytes().await?;
-
-        Ok(bytes_file)
+        Ok(resp.into_body())
     }
 }
 
@@ -354,10 +334,9 @@ impl Adapter {
         for _i in 0..1000 {
             let req = self.atomic_get_object_request(path)?;
             let resp = self.client.send(req).await?;
-            let bytes = resp.into_body().bytes().await?;
+            let bytes = resp.into_body();
             let query_result: QueryResultStruct =
-                serde_json::from_str(std::str::from_utf8(&bytes).unwrap())
-                    .map_err(new_json_deserialize_error)?;
+                serde_json::from_reader(bytes.reader()).map_err(new_json_deserialize_error)?;
             if !expect_exist && query_result.results.is_empty() {
                 break;
             }
@@ -371,30 +350,30 @@ impl Adapter {
     }
 }
 
-#[async_trait]
 impl kv::Adapter for Adapter {
-    fn metadata(&self) -> kv::Metadata {
-        kv::Metadata::new(
+    type Scanner = ();
+
+    fn info(&self) -> kv::Info {
+        kv::Info::new(
             Scheme::Atomicserver,
             "atomicserver",
             Capability {
                 read: true,
                 write: true,
                 delete: true,
-                create_dir: true,
+                shared: true,
                 ..Default::default()
             },
         )
     }
 
-    async fn get(&self, path: &str) -> Result<Option<Vec<u8>>> {
+    async fn get(&self, path: &str) -> Result<Option<Buffer>> {
         let req = self.atomic_get_object_request(path)?;
         let resp = self.client.send(req).await?;
-        let bytes = resp.into_body().bytes().await?;
+        let bytes = resp.into_body();
 
         let query_result: QueryResultStruct =
-            serde_json::from_str(std::str::from_utf8(&bytes).unwrap())
-                .map_err(new_json_deserialize_error)?;
+            serde_json::from_reader(bytes.reader()).map_err(new_json_deserialize_error)?;
 
         if query_result.results.is_empty() {
             return Err(Error::new(
@@ -407,17 +386,16 @@ impl kv::Adapter for Adapter {
             .download_from_url(&query_result.results[0].download_url)
             .await?;
 
-        Ok(Some(bytes_file.to_vec()))
+        Ok(Some(bytes_file))
     }
 
-    async fn set(&self, path: &str, value: &[u8]) -> Result<()> {
+    async fn set(&self, path: &str, value: Buffer) -> Result<()> {
         let req = self.atomic_get_object_request(path)?;
         let res = self.client.send(req).await?;
-        let bytes = res.into_body().bytes().await?;
+        let bytes = res.into_body();
 
         let query_result: QueryResultStruct =
-            serde_json::from_str(std::str::from_utf8(&bytes).unwrap())
-                .map_err(new_json_deserialize_error)?;
+            serde_json::from_reader(bytes.reader()).map_err(new_json_deserialize_error)?;
 
         for result in query_result.results {
             let req = self.atomic_delete_object_request(&result.id)?;
@@ -426,7 +404,7 @@ impl kv::Adapter for Adapter {
 
         let _ = self.wait_for_resource(path, false).await;
 
-        let req = self.atomic_post_object_request(path, value).await?;
+        let req = self.atomic_post_object_request(path, value)?;
         let _res = self.client.send(req).await?;
         let _ = self.wait_for_resource(path, true).await;
 
@@ -436,11 +414,10 @@ impl kv::Adapter for Adapter {
     async fn delete(&self, path: &str) -> Result<()> {
         let req = self.atomic_get_object_request(path)?;
         let res = self.client.send(req).await?;
-        let bytes = res.into_body().bytes().await?;
+        let bytes = res.into_body();
 
         let query_result: QueryResultStruct =
-            serde_json::from_str(std::str::from_utf8(&bytes).unwrap())
-                .map_err(new_json_deserialize_error)?;
+            serde_json::from_reader(bytes.reader()).map_err(new_json_deserialize_error)?;
 
         for result in query_result.results {
             let req = self.atomic_delete_object_request(&result.id)?;

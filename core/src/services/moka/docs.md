@@ -10,7 +10,6 @@ This service can be used to:
 - [ ] copy
 - [ ] rename
 - [ ] list
-- [x] scan
 - [ ] presign
 - [ ] blocking
 
@@ -21,7 +20,6 @@ This service can be used to:
 - `time_to_live`: Set the time to live of the cache.
 - `time_to_idle`: Set the time to idle of the cache.
 - `num_segments`: Set the segments number of the cache.
-- `thread_pool_enabled`: Decides whether to enable thread pool of the cache.
 
 You can refer to [`MokaBuilder`]'s docs for more information
 
@@ -29,15 +27,15 @@ You can refer to [`MokaBuilder`]'s docs for more information
 
 ### Via Builder
 
-```rust
+```rust,no_run
 use anyhow::Result;
 use opendal::services::Moka;
 use opendal::Operator;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut builder = Moka::default();
-    builder.name("opendal");
+    let mut builder = Moka::default()
+        .name("opendal");
 
     let op: Operator = Operator::new(builder)?.finish();
     Ok(())
